@@ -12,29 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate grin_util as util;
-extern crate walkdir;
+use grin_util as util;
 
+use self::util::file;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
-use util::file;
-use walkdir::WalkDir;
 
 #[test]
 fn copy_dir() {
 	let root = Path::new("./target/tmp2");
 	fs::create_dir_all(root.join("./original/sub")).unwrap();
 	fs::create_dir_all(root.join("./original/sub2")).unwrap();
-	write_files("original".to_string(),&root).unwrap();
+	write_files("original".to_string(), &root).unwrap();
 	let original_path = Path::new("./target/tmp2/original");
 	let copy_path = Path::new("./target/tmp2/copy");
 	file::copy_dir_to(original_path, copy_path).unwrap();
-	let original_files = file::list_files("./target/tmp2/original".to_string());
-	let copied_files = file::list_files("./target/tmp2/copy".to_string());
-	for i in 1..5 {
-		assert_eq!(copied_files[i],original_files[i]);
-	}
+	let original_files = file::list_files(&Path::new("./target/tmp2/original"));
+	let copied_files = file::list_files(&Path::new("./target/tmp2/copy"));
+	assert_eq!(original_files, copied_files);
 	fs::remove_dir_all(root).unwrap();
 }
 

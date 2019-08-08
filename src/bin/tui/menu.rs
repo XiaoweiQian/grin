@@ -24,12 +24,12 @@ use cursive::views::{
 };
 use cursive::Cursive;
 
-use tui::constants::{
+use crate::tui::constants::{
 	MAIN_MENU, ROOT_STACK, SUBMENU_MINING_BUTTON, VIEW_BASIC_STATUS, VIEW_MINING, VIEW_PEER_SYNC,
 	VIEW_VERSION,
 };
 
-pub fn create() -> Box<View> {
+pub fn create() -> Box<dyn View> {
 	let mut main_menu = SelectView::new().h_align(HAlign::Left).with_id(MAIN_MENU);
 	main_menu
 		.get_mut()
@@ -83,6 +83,7 @@ pub fn create() -> Box<View> {
 		.child(TextView::new("------------------"))
 		.child(TextView::new("Tab/Arrow : Cycle "))
 		.child(TextView::new("Enter     : Select"))
+		.child(TextView::new("Esc       : Back  "))
 		.child(TextView::new("Q         : Quit  "));
 	Box::new(main_menu)
 }

@@ -1,11 +1,10 @@
-extern crate grin_api as api;
-extern crate grin_util as util;
-extern crate hyper;
+use grin_api as api;
+use grin_util as util;
 
-use api::*;
-use hyper::{Body, Request};
+use crate::api::*;
+use hyper::{Body, Request, StatusCode};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{thread, time};
 
@@ -28,7 +27,7 @@ pub struct CounterMiddleware {
 impl CounterMiddleware {
 	fn new() -> CounterMiddleware {
 		CounterMiddleware {
-			counter: ATOMIC_USIZE_INIT,
+			counter: AtomicUsize::new(0),
 		}
 	}
 
@@ -41,10 +40,13 @@ impl Handler for CounterMiddleware {
 	fn call(
 		&self,
 		req: Request<Body>,
-		mut handlers: Box<Iterator<Item = HandlerObj>>,
+		mut handlers: Box<dyn Iterator<Item = HandlerObj>>,
 	) -> ResponseFuture {
 		self.counter.fetch_add(1, Ordering::SeqCst);
-		handlers.next().unwrap().call(req, handlers)
+		match handlers.next() {
+			Some(h) => h.call(req, handlers),
+			None => return response(StatusCode::INTERNAL_SERVER_ERROR, "no handler found"),
+		}
 	}
 }
 
@@ -69,9 +71,9 @@ fn test_start_api() {
 	router.add_middleware(counter.clone());
 	let server_addr = "127.0.0.1:14434";
 	let addr: SocketAddr = server_addr.parse().expect("unable to parse server address");
-	assert!(server.start(addr, router).is_ok());
+	assert!(server.start(addr, router, None).is_ok());
 	let url = format!("http://{}/v1/", server_addr);
-	let index = api::client::get::<Vec<String>>(url.as_str()).unwrap();
+	let index = request_with_retry(url.as_str()).unwrap();
 	assert_eq!(index.len(), 2);
 	assert_eq!(counter.value(), 1);
 	assert!(server.stop());
@@ -86,17 +88,31 @@ fn test_start_api() {
 #[test]
 fn test_start_api_tls() {
 	util::init_test_logger();
-	let tls_conf = TLSConfig {
-		pkcs_bytes: include_bytes!("localhost+1.p12").to_vec(),
-		pass: "changeit".to_string(),
-	};
+	let tls_conf = TLSConfig::new(
+		"tests/fullchain.pem".to_string(),
+		"tests/privkey.pem".to_string(),
+	);
 	let mut server = ApiServer::new();
 	let router = build_router();
-	let server_addr = "127.0.0.1:14444";
+	let server_addr = "0.0.0.0:14444";
 	let addr: SocketAddr = server_addr.parse().expect("unable to parse server address");
-	assert!(server.start_tls(addr, router, tls_conf).is_ok());
-	let url = format!("https://{}/v1/", server_addr);
-	let index = api::client::get::<Vec<String>>(url.as_str()).unwrap();
+	assert!(server.start(addr, router, Some(tls_conf)).is_ok());
+	let index = request_with_retry("https://yourdomain.com:14444/v1/").unwrap();
 	assert_eq!(index.len(), 2);
 	assert!(!server.stop());
+}
+
+fn request_with_retry(url: &str) -> Result<Vec<String>, api::Error> {
+	let mut tries = 0;
+	loop {
+		let res = api::client::get::<Vec<String>>(url, None);
+		if res.is_ok() {
+			return res;
+		}
+		if tries > 5 {
+			return res;
+		}
+		tries += 1;
+		thread::sleep(time::Duration::from_millis(500));
+	}
 }

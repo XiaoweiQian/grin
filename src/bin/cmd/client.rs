@@ -17,28 +17,30 @@ use std::net::SocketAddr;
 
 use clap::ArgMatches;
 
-use api;
-use config::GlobalConfig;
-use p2p;
-use servers::ServerConfig;
+use crate::api;
+use crate::config::GlobalConfig;
+use crate::p2p;
+use crate::servers::ServerConfig;
+use crate::util::file::get_first_line;
 use term;
 
-pub fn client_command(client_args: &ArgMatches, global_config: GlobalConfig) {
+pub fn client_command(client_args: &ArgMatches<'_>, global_config: GlobalConfig) -> i32 {
 	// just get defaults from the global config
 	let server_config = global_config.members.unwrap().server;
+	let api_secret = get_first_line(server_config.api_secret_path.clone());
 
 	match client_args.subcommand() {
 		("status", Some(_)) => {
-			show_status(&server_config);
+			show_status(&server_config, api_secret);
 		}
 		("listconnectedpeers", Some(_)) => {
-			list_connected_peers(&server_config);
+			list_connected_peers(&server_config, api_secret);
 		}
 		("ban", Some(peer_args)) => {
 			let peer = peer_args.value_of("peer").unwrap();
 
 			if let Ok(addr) = peer.parse() {
-				ban_peer(&server_config, &addr);
+				ban_peer(&server_config, &addr, api_secret);
 			} else {
 				panic!("Invalid peer address format");
 			}
@@ -47,27 +49,32 @@ pub fn client_command(client_args: &ArgMatches, global_config: GlobalConfig) {
 			let peer = peer_args.value_of("peer").unwrap();
 
 			if let Ok(addr) = peer.parse() {
-				unban_peer(&server_config, &addr);
+				unban_peer(&server_config, &addr, api_secret);
 			} else {
 				panic!("Invalid peer address format");
 			}
 		}
 		_ => panic!("Unknown client command, use 'grin help client' for details"),
 	}
+	0
 }
 
-pub fn show_status(config: &ServerConfig) {
+pub fn show_status(config: &ServerConfig, api_secret: Option<String>) {
 	println!();
 	let title = format!("Grin Server Status");
+	if term::stdout().is_none() {
+		println!("Could not open terminal");
+		return;
+	}
 	let mut t = term::stdout().unwrap();
 	let mut e = term::stdout().unwrap();
 	t.fg(term::color::MAGENTA).unwrap();
 	writeln!(t, "{}", title).unwrap();
 	writeln!(t, "--------------------------").unwrap();
 	t.reset().unwrap();
-	match get_status_from_node(config) {
+	match get_status_from_node(config, api_secret) {
 		Ok(status) => {
-			writeln!(e, "Protocol version: {}", status.protocol_version).unwrap();
+			writeln!(e, "Protocol version: {:?}", status.protocol_version).unwrap();
 			writeln!(e, "User agent: {}", status.user_agent).unwrap();
 			writeln!(e, "Connections: {}", status.connections).unwrap();
 			writeln!(e, "Chain height: {}", status.tip.height).unwrap();
@@ -78,13 +85,14 @@ pub fn show_status(config: &ServerConfig) {
 		Err(_) => writeln!(
 			e,
 			"WARNING: Client failed to get data. Is your `grin server` offline or broken?"
-		).unwrap(),
+		)
+		.unwrap(),
 	};
 	e.reset().unwrap();
 	println!()
 }
 
-pub fn ban_peer(config: &ServerConfig, peer_addr: &SocketAddr) {
+pub fn ban_peer(config: &ServerConfig, peer_addr: &SocketAddr, api_secret: Option<String>) {
 	let params = "";
 	let mut e = term::stdout().unwrap();
 	let url = format!(
@@ -92,14 +100,14 @@ pub fn ban_peer(config: &ServerConfig, peer_addr: &SocketAddr) {
 		config.api_http_addr,
 		peer_addr.to_string()
 	);
-	match api::client::post_no_ret(url.as_str(), &params).map_err(|e| Error::API(e)) {
+	match api::client::post_no_ret(url.as_str(), api_secret, &params).map_err(|e| Error::API(e)) {
 		Ok(_) => writeln!(e, "Successfully banned peer {}", peer_addr.to_string()).unwrap(),
 		Err(_) => writeln!(e, "Failed to ban peer {}", peer_addr).unwrap(),
 	};
 	e.reset().unwrap();
 }
 
-pub fn unban_peer(config: &ServerConfig, peer_addr: &SocketAddr) {
+pub fn unban_peer(config: &ServerConfig, peer_addr: &SocketAddr, api_secret: Option<String>) {
 	let params = "";
 	let mut e = term::stdout().unwrap();
 	let url = format!(
@@ -107,25 +115,33 @@ pub fn unban_peer(config: &ServerConfig, peer_addr: &SocketAddr) {
 		config.api_http_addr,
 		peer_addr.to_string()
 	);
-	match api::client::post_no_ret(url.as_str(), &params).map_err(|e| Error::API(e)) {
+	let res: Result<(), api::Error>;
+	res = api::client::post_no_ret(url.as_str(), api_secret, &params);
+
+	match res.map_err(|e| Error::API(e)) {
 		Ok(_) => writeln!(e, "Successfully unbanned peer {}", peer_addr).unwrap(),
 		Err(_) => writeln!(e, "Failed to unban peer {}", peer_addr).unwrap(),
 	};
 	e.reset().unwrap();
 }
 
-pub fn list_connected_peers(config: &ServerConfig) {
+pub fn list_connected_peers(config: &ServerConfig, api_secret: Option<String>) {
 	let mut e = term::stdout().unwrap();
 	let url = format!("http://{}/v1/peers/connected", config.api_http_addr);
-	match api::client::get::<Vec<p2p::PeerInfo>>(url.as_str()).map_err(|e| Error::API(e)) {
+	// let peers_info: Result<Vec<p2p::PeerInfoDisplay>, api::Error>;
+
+	let peers_info = api::client::get::<Vec<p2p::types::PeerInfoDisplay>>(url.as_str(), api_secret);
+
+	match peers_info.map_err(|e| Error::API(e)) {
 		Ok(connected_peers) => {
 			let mut index = 0;
 			for connected_peer in connected_peers {
 				writeln!(e, "Peer {}:", index).unwrap();
 				writeln!(e, "Capabilities: {:?}", connected_peer.capabilities).unwrap();
 				writeln!(e, "User agent: {}", connected_peer.user_agent).unwrap();
-				writeln!(e, "Version: {}", connected_peer.version).unwrap();
+				writeln!(e, "Version: {:?}", connected_peer.version).unwrap();
 				writeln!(e, "Peer address: {}", connected_peer.addr).unwrap();
+				writeln!(e, "Height: {}", connected_peer.height).unwrap();
 				writeln!(e, "Total difficulty: {}", connected_peer.total_difficulty).unwrap();
 				writeln!(e, "Direction: {:?}", connected_peer.direction).unwrap();
 				println!();
@@ -134,12 +150,16 @@ pub fn list_connected_peers(config: &ServerConfig) {
 		}
 		Err(_) => writeln!(e, "Failed to get connected peers").unwrap(),
 	};
+
 	e.reset().unwrap();
 }
 
-fn get_status_from_node(config: &ServerConfig) -> Result<api::Status, Error> {
+fn get_status_from_node(
+	config: &ServerConfig,
+	api_secret: Option<String>,
+) -> Result<api::Status, Error> {
 	let url = format!("http://{}/v1/status", config.api_http_addr);
-	api::client::get::<api::Status>(url.as_str()).map_err(|e| Error::API(e))
+	api::client::get::<api::Status>(url.as_str(), api_secret).map_err(|e| Error::API(e))
 }
 
 /// Error type wrapping underlying module errors.

@@ -18,20 +18,22 @@
 //! To use it, just have your service(s) implement the ApiEndpoint trait and
 //! register them on a ApiServer.
 
-use failure::{Backtrace, Context, Fail};
+use crate::router::{Handler, HandlerObj, ResponseFuture, Router};
+use crate::web::response;
+use failure::{Backtrace, Context, Fail, ResultExt};
 use futures::sync::oneshot;
 use futures::Stream;
 use hyper::rt::Future;
-use hyper::server::conn::Http;
-use hyper::{rt, Body, Request, Server};
-use native_tls::{Identity, TlsAcceptor};
-use router::{Handler, HandlerObj, ResponseFuture, Router};
+use hyper::{rt, Body, Request, Server, StatusCode};
+use rustls;
+use rustls::internal::pemfile;
 use std::fmt::{self, Display};
+use std::fs::File;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::{io, thread};
-use tokio::net::TcpListener;
-use tokio_tls;
-use util::LOGGER;
+use tokio_rustls::ServerConfigExt;
+use tokio_tcp;
 
 /// Errors that can be returned by an ApiEndpoint implementation.
 #[derive(Debug)]
@@ -54,7 +56,7 @@ pub enum ErrorKind {
 }
 
 impl Fail for Error {
-	fn cause(&self) -> Option<&Fail> {
+	fn cause(&self) -> Option<&dyn Fail> {
 		self.inner.cause()
 	}
 
@@ -64,7 +66,7 @@ impl Fail for Error {
 }
 
 impl Display for Error {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		Display::fmt(&self.inner, f)
 	}
 }
@@ -90,9 +92,58 @@ impl From<Context<ErrorKind>> for Error {
 }
 
 /// TLS config
+#[derive(Clone)]
 pub struct TLSConfig {
-	pub pkcs_bytes: Vec<u8>,
-	pub pass: String,
+	pub certificate: String,
+	pub private_key: String,
+}
+
+impl TLSConfig {
+	pub fn new(certificate: String, private_key: String) -> TLSConfig {
+		TLSConfig {
+			certificate,
+			private_key,
+		}
+	}
+
+	fn load_certs(&self) -> Result<Vec<rustls::Certificate>, Error> {
+		let certfile = File::open(&self.certificate).context(ErrorKind::Internal(format!(
+			"failed to open file {}",
+			self.certificate
+		)))?;
+		let mut reader = io::BufReader::new(certfile);
+
+		pemfile::certs(&mut reader)
+			.map_err(|_| ErrorKind::Internal("failed to load certificate".to_string()).into())
+	}
+
+	fn load_private_key(&self) -> Result<rustls::PrivateKey, Error> {
+		let keyfile = File::open(&self.private_key).context(ErrorKind::Internal(format!(
+			"failed to open file {}",
+			self.private_key
+		)))?;
+		let mut reader = io::BufReader::new(keyfile);
+
+		let keys = pemfile::pkcs8_private_keys(&mut reader)
+			.map_err(|_| ErrorKind::Internal("failed to load private key".to_string()))?;
+		if keys.len() != 1 {
+			return Err(ErrorKind::Internal(
+				"expected a single private key".to_string(),
+			))?;
+		}
+		Ok(keys[0].clone())
+	}
+
+	pub fn build_server_config(&self) -> Result<Arc<rustls::ServerConfig>, Error> {
+		let certs = self.load_certs()?;
+		let key = self.load_private_key()?;
+		let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
+		cfg.set_single_cert(certs, key)
+			.context(ErrorKind::Internal(
+				"set single certificate failed".to_string(),
+			))?;
+		Ok(Arc::new(cfg))
+	}
 }
 
 /// HTTP server allowing the registration of ApiEndpoint implementations.
@@ -109,8 +160,22 @@ impl ApiServer {
 		}
 	}
 
-	/// Starts the ApiServer at the provided address.
+	/// Starts ApiServer at the provided address.
+	/// TODO support stop operation
 	pub fn start(
+		&mut self,
+		addr: SocketAddr,
+		router: Router,
+		conf: Option<TLSConfig>,
+	) -> Result<thread::JoinHandle<()>, Error> {
+		match conf {
+			Some(conf) => self.start_tls(addr, router, conf),
+			None => self.start_no_tls(addr, router),
+		}
+	}
+
+	/// Starts the ApiServer at the provided address.
+	fn start_no_tls(
 		&mut self,
 		addr: SocketAddr,
 		router: Router,
@@ -127,7 +192,7 @@ impl ApiServer {
 			.spawn(move || {
 				let server = Server::bind(&addr)
 					.serve(router)
-					// TODO graceful shutdown is unstable, investigate 
+					// TODO graceful shutdown is unstable, investigate
 					//.with_graceful_shutdown(rx)
 					.map_err(|e| eprintln!("HTTP API server error: {}", e));
 
@@ -138,7 +203,7 @@ impl ApiServer {
 
 	/// Starts the TLS ApiServer at the provided address.
 	/// TODO support stop operation
-	pub fn start_tls(
+	fn start_tls(
 		&mut self,
 		addr: SocketAddr,
 		router: Router,
@@ -149,39 +214,27 @@ impl ApiServer {
 				"Can't start HTTPS API server, it's running already".to_string(),
 			))?;
 		}
+
+		let tls_conf = conf.build_server_config()?;
+
 		thread::Builder::new()
 			.name("apis".to_string())
 			.spawn(move || {
-				let cert = Identity::from_pkcs12(conf.pkcs_bytes.as_slice(), &conf.pass).unwrap();
-				let tls_cx = TlsAcceptor::builder(cert).build().unwrap();
-				let tls_cx = tokio_tls::TlsAcceptor::from(tls_cx);
-				let srv = TcpListener::bind(&addr).expect("Error binding local port");
-				// Use lower lever hyper API to be able to intercept client connection
-				let server = Http::new()
-					.serve_incoming(
-						srv.incoming().and_then(move |socket| {
-							tls_cx
-								.accept(socket)
-								.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-						}),
-						router,
-					)
-					.then(|res| match res {
-						Ok(conn) => Ok(Some(conn)),
+				let listener = tokio_tcp::TcpListener::bind(&addr).expect("failed to bind");
+				let tls = listener
+					.incoming()
+					.and_then(move |s| tls_conf.accept_async(s))
+					.then(|r| match r {
+						Ok(x) => Ok::<_, io::Error>(Some(x)),
 						Err(e) => {
-							eprintln!("Error: {}", e);
+							error!("accept_async failed: {}", e);
 							Ok(None)
 						}
 					})
-					.for_each(|conn_opt| {
-						if let Some(conn) = conn_opt {
-							rt::spawn(
-								conn.and_then(|c| c.map_err(|e| panic!("Hyper error {}", e)))
-									.map_err(|e| eprintln!("Connection error {}", e)),
-							);
-						}
-						Ok(())
-					});
+					.filter_map(|x| x);
+				let server = Server::builder(tls)
+					.serve(router)
+					.map_err(|e| eprintln!("HTTP API server error: {}", e));
 
 				rt::run(server);
 			})
@@ -194,13 +247,10 @@ impl ApiServer {
 			// TODO re-enable stop after investigation
 			//let tx = mem::replace(&mut self.shutdown_sender, None).unwrap();
 			//tx.send(()).expect("Failed to stop API server");
-			info!(LOGGER, "API server has been stoped");
+			info!("API server has been stoped");
 			true
 		} else {
-			error!(
-				LOGGER,
-				"Can't stop API server, it's not running or doesn't spport stop operation"
-			);
+			error!("Can't stop API server, it's not running or doesn't spport stop operation");
 			false
 		}
 	}
@@ -212,9 +262,12 @@ impl Handler for LoggingMiddleware {
 	fn call(
 		&self,
 		req: Request<Body>,
-		mut handlers: Box<Iterator<Item = HandlerObj>>,
+		mut handlers: Box<dyn Iterator<Item = HandlerObj>>,
 	) -> ResponseFuture {
-		debug!(LOGGER, "REST call: {} {}", req.method(), req.uri().path());
-		handlers.next().unwrap().call(req, handlers)
+		debug!("REST call: {} {}", req.method(), req.uri().path());
+		match handlers.next() {
+			Some(handler) => handler.call(req, handlers),
+			None => response(StatusCode::INTERNAL_SERVER_ERROR, "no handler found"),
+		}
 	}
 }
